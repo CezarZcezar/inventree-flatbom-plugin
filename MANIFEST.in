@@ -1,0 +1,2 @@
+include README.md LICENSE
+recursive-include inventree_flat_bom/static *.js
