@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
 
 from django.http import Http404, HttpResponse, HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
@@ -71,6 +71,8 @@ class BomLoader:
         self.Part = Part
         self.lines: dict[int, list[Line]] = {}
         self.assembly: dict[int, bool] = {}
+        #: BomItem pk -> validated flag
+        self.validated: dict[int, bool] = {}
 
     def is_assembly(self, pk: int) -> bool:
         if pk not in self.assembly:
@@ -84,6 +86,7 @@ class BomLoader:
             lines = []
             for item in items:
                 self.assembly[item.sub_part_id] = bool(item.sub_part.assembly)
+                self.validated[item.pk] = bool(item.validated)
                 lines.append(
                     Line(
                         sub_part=item.sub_part_id,
@@ -166,6 +169,8 @@ def build_flat_bom(part, quantity: Decimal, include_optional: bool, with_stock: 
             'optional': leaf.optional,
             'consumable': leaf.consumable,
             'virtual': bool(p.virtual),
+            # All BOM lines this part comes from have been validated
+            'validated': bool(leaf.bom_items) and all(loader.validated.get(i, False) for i in leaf.bom_items),
             'empty_bom': leaf.empty_bom,
             'sources': sorted(
                 ({'pk': pk, 'name': source_names.get(pk, str(pk)), 'quantity': qty} for pk, qty in leaf.sources.items()),
@@ -179,10 +184,15 @@ def build_flat_bom(part, quantity: Decimal, include_optional: bool, with_stock: 
             in_stock = Decimal(p.total_in_stock or 0)
             available = Decimal(p.unallocated_stock or 0)
             on_order = Decimal(p.ordering or 0)
+            # Number of top level assemblies which the available stock of this part is enough for
+            per_unit = leaf.quantity / quantity
+            can_build = None if p.virtual or per_unit <= 0 else (available / per_unit).to_integral_value(ROUND_FLOOR)
             row.update({
                 'in_stock': in_stock,
                 'available': available,
                 'on_order': on_order,
+                'in_production': Decimal(p.building or 0),
+                'can_build': can_build,
                 # Virtual parts have no stock, so a shortage makes no sense for them
                 'shortage': None if p.virtual else shortage(leaf.quantity, available),
                 'shortage_after_orders': None if p.virtual else shortage(leaf.quantity, available + on_order),
@@ -374,12 +384,14 @@ def export_table(rows: list[dict], options: dict, with_stock: bool, numeric: boo
     n_manufacturers = max((len(v) for v in manufacturers.values()), default=0)
     parameter_ids = sorted(parameter_names, key=lambda pk: parameter_names[pk].lower())
 
-    headers = ['IPN', 'Component', 'Category', 'Description', 'Reference', 'Quantity', 'Units']
+    headers = ['IPN', 'Component ID', 'Component Name', 'Category ID', 'Category Name',
+               'Description', 'Reference', 'Quantity', 'Units']
     if stock:
-        headers += ['In Stock', 'Available Stock', 'On Order', 'Shortage', 'Shortage incl. On Order']
+        headers += ['In Stock', 'Available Stock', 'On Order', 'In Production', 'Can Build',
+                    'Shortage', 'Shortage incl. On Order']
     if options['pricing']:
         headers += ['Currency', 'Unit Price Min', 'Unit Price Max', 'Total Price Min', 'Total Price Max']
-    headers += ['Optional', 'Consumable', 'Virtual']
+    headers += ['Optional', 'Consumable', 'Virtual', 'Validated']
     if options['used_in']:
         headers += ['Used In']
     headers += [f'Substitute {i + 1}' for i in range(n_substitutes)]
@@ -397,7 +409,9 @@ def export_table(rows: list[dict], options: dict, with_stock: bool, numeric: boo
     for r in rows:
         row = [
             sanitize(r['ipn']),
+            r['pk'],
             sanitize(r['display_name']),
+            r['category_pk'] if r['category_pk'] is not None else '',
             sanitize(r['category_path']),
             sanitize(r['description']),
             sanitize(r['reference']),
@@ -406,11 +420,12 @@ def export_table(rows: list[dict], options: dict, with_stock: bool, numeric: boo
         ]
         if stock:
             row += [num(r['in_stock']), num(r['available']), num(r['on_order']),
+                    num(r['in_production']), num(r['can_build']),
                     num(r['shortage']), num(r['shortage_after_orders'])]
         if options['pricing']:
             row += [r['currency'], num(r['unit_price_min']), num(r['unit_price_max']),
                     num(r['total_price_min']), num(r['total_price_max'])]
-        row += [r['optional'], r['consumable'], r['virtual']]
+        row += [r['optional'], r['consumable'], r['virtual'], r['validated']]
         if options['used_in']:
             row.append(sanitize('; '.join(f"{s['name']}: {fmt_decimal(s['quantity'])}" for s in r['sources'])))
         row += padded(substitutes.get(r['pk'], []), n_substitutes)
